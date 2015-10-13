@@ -1,0 +1,473 @@
+<?php
+// $Id$
+/**
+* @file
+* TW SPARQL Module.
+*/
+
+/*******************************************************************************
+* Hook Functions (Drupal)
+******************************************************************************/
+
+global $twsparql_last_rdf_document;
+global $twsparql_last_referer;
+global $twsparql_last_qid;
+global $twsparql_added_block_header;
+$twsparql_last_rdf_document = NULL;
+$twsparql_last_referer = NULL;
+$twsparql_last_qid = NULL;
+$twsparql_added_block_header = FALSE;
+
+include_once('DrupalTWSparql.inc');
+
+/**
+ * Outputs the raw results of a SPARQL query
+ * see http://api.drupal.org/api/drupal/includes--file.inc/function/file_transfer/6
+ * @param $type The Content-Type of the results parameter
+ * @param $results The body of the results
+ */
+function twsparql_output_results($type, $results) {
+  if (ob_get_level()) {
+    ob_end_clean();
+  }
+
+  if (isset($_SERVER['HTTPS']) && ($_SERVER['HTTPS'] == 'on')) {
+    drupal_set_header('Cache-Control: private');
+    drupal_set_header('Pragma: private');
+  }
+
+  $type = preg_replace('/\r?\n(?!\t| )/', '', $type);
+  drupal_set_header("Content-Type: $type");
+  print $results;
+  exit();
+}
+
+/** Display help and module information
+ * @param $path which path of the site we're displaying help
+ * @param $arg array that holds the current path as would be returned from arg() function
+ * @return help text for the path
+ */
+function twsparql_help($path, $arg)
+{
+  $output = "";
+  switch ($path) {
+  case "admin/help/twsparql":
+    $output = '<p>'.  t("TW SPARQL module looks for a special &lt;sparql&gt; tag in the body of a page to generate HTML content using a SPARQL endpoint.") .'</p>';
+    break;
+  default:
+    $output = "";
+  }
+  return $output;
+}
+
+/**
+* Valid permissions for this module
+*
+* Tells Drupal who has access to administer the TW Sparql module
+*
+* @return array An array of valid permissions for the provenance module
+*/
+function twsparql_perm() {
+  return array('administer tw sparql','use external query interface');
+}
+
+/** Admin menu for this module
+* @return array An array with this module's settings.
+*/
+function twsparql_menu()
+{
+  $items = array();
+
+  $items['admin/settings/twsparql'] = array(
+    'title' => 'TW SPARQL Settings',
+    'description' => 'Settings for the TW SPARQL module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('twsparql_admin_settings'),
+    'access arguments' => array('administer tw sparql'),
+    'type' => MENU_NORMAL_ITEM
+    );
+
+  $items['twsparql/query'] = array(
+    'title' => 'TW SPARQL Endpoint',
+    'description' => 'Executes SPARQL evaluations against the endpoint',
+    'page callback' => 'twsparql_external_query',
+    'access arguments' => array('use external query interface'),
+    'type' => MENU_CALLBACK
+  );
+
+  return $items;
+}
+
+/** Drupal hook_nodeapi hook. This is the entry point for this module.
+ *
+ * Allows the user to use the sparql tag inside of a drupal page and
+ * have the query run and results translated into html to replace the
+ * sparql tag
+ *
+ * @param  $node Reference to the specific node in the graph 
+ * @param  $op   Query opearation to use on Database
+ * @param  $a3   defaults to NULL, defined by Drupal API
+ * @param  $a4   defaults to NULL, defined by Drupal API
+ */
+function twsparql_nodeapi( &$node, $op, $a3=NULL, $a4=NULL )
+{
+  $nid = $node->nid;
+  switch( $op )
+  {
+    case 'presave':
+    case 'delete':
+      $result = db_query("DELETE FROM {twsparql_content_cache_queries} WHERE nid = %d",$nid);
+      $result = db_query("DELETE FROM {twsparql_content_cache_xslt} WHERE nid = %d",$nid);
+      $result = db_query("DELETE FROM {twsparql_final_cache} WHERE nid = %d",$nid);
+      $result = db_query("DELETE FROM {twsparql_query_result_cache} WHERE nid = %d",$nid);
+      break;
+    case 'update':
+    case 'insert':
+      break;
+    case 'view':
+	  $newStuff = TWSparql::$engine->render( $nid,
+											 $node->content["body"]["#value"] );
+      $node->content["body"]["#value"] = $newStuff ;
+      break;
+    case 'save':
+      break;
+  }
+}
+
+/** Drupal hook_block hook. Be able to use sparql tag in Drupal blocks.
+ *
+ * Declares a block or set of blocks. Argument passed in for $op tells
+ * the function what to return. 4 arguments can be passed in for $op:
+ * list, configure, save, and view.
+ *
+ * @param  string  $op    defaults to 'list', what type of information
+ * to retrieve about the block(s).
+ * @param  integer $delta defaults to 0, which block to view. Array
+ * key that 'list' returns
+ * @param  array   $edit  defaults to empty array, if $op is save,
+ * submits form values to config file
+ * @return is based on argument passed in for $op. 
+ */
+function twsparql_block( $op = 'list', $delta = 0, $edit = array() )
+{
+  global $twsparql_added_block_header;
+  $data = block_block($op, $delta, $edit);
+  switch( $op )
+  {
+    case 'view':
+      // FIXME: 0 should be the actual pageid, blockid, whatever
+	  $data['content'] = TWSparql::$engine->render( 0, $data['content'] ) ;
+      if(!$twsparql_added_block_header)
+        drupal_set_html_head('<link href="/css/block.css" rel="stylesheet" type="text/css"/>');
+      $twsparql_added_block_header = TRUE;
+      break;
+    case 'list':
+      foreach($data as $bid => $block) {
+        $block['info'] .= " (w/ SPARQL)";
+        $data[$bid] = $block;
+      }
+      break;
+    case 'configure':
+    case 'save':
+      break;
+  }
+  return $data;
+}
+
+/** @brief AJAX interface for executing SPARQL from client rather then
+ * server
+ * 
+ * Constructs a query to send to the function twsparql_output_results()
+ * to return raw results of a SPARQL query. This is used in pages that
+ * utilize pagination, such as publication pagination
+ * 
+ */
+function twsparql_external_query()
+{
+  $copy = $_GET;
+  $queryFile = $copy["query"];
+  $xsltFile = $copy["xslt"];
+
+  if(preg_match("/SELECT/i", $queryFile)>0) {
+    $url = twsparql_get_endpoint()."?query=".urlencode($queryFile);
+    $content = file_get_contents($url);
+    twsparql_output_results("application/sparql-results+xml", $content);
+    return;
+  }
+  else if(preg_match("/CONSTRUCT/i", $queryFile)>0) {
+    $url = twsparql_get_endpoint()."?query=".urlencode($queryFile);
+    $content = file_get_contents($url);
+    twsparql_output_results("application/rdf+xml", $content);
+    return;
+  }
+  else if(preg_match("/DESCRIBE/i", $queryFile)>0) {
+    $url = twsparql_get_endpoint()."?query=".urlencode($queryFile);
+    $content = file_get_contents($url);
+    twsparql_output_results("application/rdf+xml", $content);
+    return;
+  }
+  else if(preg_match("/ASK/i", $queryFile)>0) {
+    $url = twsparql_get_endpoint()."?query=".urlencode($queryFile);
+    $content = file_get_contents($url);
+    twsparql_output_results("text/plain", $content);
+    return;
+  }
+
+  $doc = new DOMDocument();
+  $xslt = new XSLTProcessor();
+
+  $str = twsparql_rfc_2396(twsparql_get_xsltpath(),$xsltFile)."?r=".urlencode($copy["uri"]);
+  $doc->substituteEntities = TRUE;
+  $doc->load($str);
+  $xslt->importStylesheet($doc);
+
+  $str = twsparql_rfc_2396(twsparql_get_querypath(),$queryFile)."?";
+  unset($copy["q"]);
+  unset($copy["query"]);
+  unset($copy["xslt"]);
+  $first = TRUE;
+  foreach($copy as $idx => $val) {
+    $str .= ($first ? "" : "&")."$idx=".urlencode($val);
+    $first = FALSE;
+  }
+  $queryText = file_get_contents($str);
+  $doc->substituteEntities = TRUE;
+  $doc->load(twsparql_get_endpoint()."?query=".urlencode($queryText));
+  $str = $xslt->transformToXML($doc);
+
+  if(strpos($str,"<sparql")!==FALSE)
+    twsparql_output_results("application/sparql-results+xml",$str);
+  else if(strpos($str,"<rdf:RDF")!==FALSE)
+    twsparql_output_results("application/rdf+xml",$str);
+  else if(strpos($str,"<?xml")!==FALSE)
+    twsparql_output_results("text/xml",$str);
+  else if(strpos($str,"<html")!==FALSE)
+    twsparql_output_results("text/html",$str);
+  else
+    twsparql_output_results("text/plain",$str);
+}
+
+include_once('common/HttpUri.inc');
+
+/**@brief Construct HTTPURI path
+ * Construct the HTTPUri path from a base and a path that is then returned.
+ * @param  string $base Base path 
+ * @param  string $path Path to be used for the URI
+ * @return string HTTPURI path
+ */
+function twsparql_rfc_2396($base,$path) {
+  if(0===strpos($path,"doi:")) {
+    $path = "http://dx.doi.org/".substr($path, 4);
+  }
+  return HttpUri::parse($base)->resolve($path)->serialize();
+}
+
+/**@brief TW SPARQL Configure
+* Create all the admin settings to configure to the TW SPARQL module.
+* The form data is saved in an array which is returned.
+* @return   array   An array of form data.
+*/
+function twsparql_admin_settings() {
+  $form = array();
+
+  $form['settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE);
+
+  $form['settings']['twsparql_endpoint'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default SPARQL Endpoint'),
+    '#default_value' => twsparql_get_endpoint(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('If a &lt;sparql&gt; tag does not specify an endpoint, this path will be used instead.')
+    );
+
+  $form['settings']['twsparql_xslt'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default XSL Transform'),
+    '#default_value' => twsparql_get_xslt(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('If a &lt;sparql&gt; tag does not specify an XSL transformation, this file will be used instead.')
+    );
+
+  $form['settings']['twsparql_querypath'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Relative Path to Named Queries'),
+    '#default_value' => twsparql_get_querypath(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('When a relative path to a named query is given, this path will be used to resolve it')
+    );
+
+  $form['settings']['twsparql_xsltpath'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Relative path to XSL Transforms'),
+    '#default_value' => twsparql_get_xsltpath(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('When a relative path to an XSL transform is specified, this path will be used to resolve it')
+    );
+
+  $form['settings']['twsparql_ibase'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Base URI for Instances'),
+    '#default_value' => twsparql_get_ibase(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('The base path for any items specified using the i= attribute')
+    );
+
+  $form['settings']['twsparql_sbase'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Base URI for Schema'),
+    '#default_value' => twsparql_get_sbase(),
+    '#maxlength' => 2048,
+    '#required' => TRUE,
+    '#description' => t('The base path for any items specified using the s= attribute')
+    );
+
+  $form['settings']['twsparql_phpext'] = array(
+    '#type' => 'radios',
+    '#title' => t('Enable PHP XSLT Extensions'),
+    '#default_value' => (int)(twsparql_get_phpext()),
+    '#options' => array(FALSE=>t('Disabled'),TRUE=>t('Enabled')),
+    '#description' => t('Enables PHP extensions in the XSLT processor, allowing stylesheets to make calls to PHP functions. Enable with caution.')
+    );
+
+  $form['settings']['twsparql_cache_enabled'] = array(
+    '#type' => 'radios',
+    '#title' => t('Enable Caching'),
+    '#default_value' => twsparql_get_cache_enabled(),
+    '#options' => array(FALSE=>t('Disabled'),TRUE=>t('Enabled')),
+    '#description' => t('Enables query caching.')
+    );
+
+  $form['settings']['twsparql_cache_expires'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default expiration time'),
+    '#default_value' => twsparql_get_cache_expires(),
+    '#maxlength' => 6,
+    '#description' => t('Sets the default expiration time.  The format is X Y where X is a number and Y is either D for Day, H for Hour or M for minute')
+    );
+
+  $form['settings']['twsparql_cache_clear'] = array(
+    '#type' => 'submit',
+    '#value' => 'Clear Cache',
+    '#submit' => array('twsparql_cache_clear'),
+    '#description' => t('Clears the cache.')
+    );
+
+  $form['settings']['twsparql_debug'] = array(
+    '#type' => 'radios',
+    '#title' => t('Enable Debug Output'),
+    '#default_value' => twsparql_debug_enabled(),
+    '#options' => array(FALSE=>t('Disabled'),TRUE=>t('Enabled')),
+    '#description' => t('Outputs debugging information regarding SPARQL queries and XSLT transformations.')
+    );
+
+  return array_merge_recursive(system_settings_form($form), array('#theme' => 'twsparql_admin_settings', 'buttons' => array('#weight' => 99)));
+}
+
+function twsparql_admin_settings_validate($form, &$form_state) {
+}
+
+function theme_twsparql_admin_settings($form) {
+}
+
+/**
+ * Check to see if cache is enabled.
+ * @return default value of TRUE. 
+ */
+function twsparql_get_cache_enabled() {
+  return TWSparql::$engine->getCacheEnabled() ;
+}
+
+/**
+ * CRUD operation on the Database to remove the cache for queries and xslt.
+ * @return db queries to remove the content from cache queries and cache xslt
+ */
+function twsparql_cache_clear() {
+  $result = db_query("DELETE FROM {twsparql_content_cache_queries}");
+  $result = db_query("DELETE FROM {twsparql_content_cache_xslt}");
+  $result = db_query("DELETE FROM {twsparql_final_cache}");
+  $result = db_query("DELETE FROM {twsparql_query_result_cache}");
+  drupal_set_message('Cache cleared','status');
+}
+
+/**
+ * Check when the page cache expires.
+ * @return the value for length of cache.
+ */
+function twsparql_get_cache_expires() {
+  return TWSparql::$engine->getCacheTTL() ;
+}
+
+/**
+ * Get the SPARQL endpoint to query against.
+ * @return the SPARQL endpoint for queries.
+ */
+function twsparql_get_endpoint() {
+  return TWSparql::$engine->getEndpoint() ;
+}
+
+/**
+ * Gets the .xslt file for the transform.
+ * @return the .xslt transform file.
+ */
+function twsparql_get_xslt() {
+  return TWSparql::$engine->getDefaultXsl() ;
+}
+
+/**
+ * Path for query directory.
+ * @return base URL for query directory.
+ */
+function twsparql_get_querypath() {
+  return TWSparql::$engine->getQueryPath() ;
+}
+
+/**
+ * Path for XML transforms. (XSL)
+ * @return base URL for xsl transforms.
+ */
+function twsparql_get_xsltpath() {
+  return TWSparql::$engine->getXsltPath() ;
+}
+
+/**
+ * Path for instances
+ * Static variable needed for the module.
+ * @return base URL for instances.
+ */
+function twsparql_get_ibase() {
+  return TWSparql::$engine->getIbase() ;
+}
+
+/**
+ * Path for the schemas
+ * @return base URL for the schemas
+ */
+function twsparql_get_sbase() {
+  return TWSparql::$engine->getSbase() ;
+}
+
+/**
+ * the php extension
+ * @return variable for twsparql_phpext
+ */
+function twsparql_get_phpext() {
+  return TWSparql::$engine->shouldEnablePHPExtensions() ;
+}
+
+/**
+ * Check if Drupal debug is enabled
+ * @return if debug is enabled
+ */
+function twsparql_debug_enabled() {
+  return TWSparql::$logger->shouldDebug() ;
+}
+
